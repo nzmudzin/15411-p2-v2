@@ -343,7 +343,7 @@ static void send_data_segment(cmu_socket_t *sock, uint8_t *payload,
   uint16_t plen = hlen + payload_len;
 
   uint8_t *pkt = create_packet(sock->my_port, ntohs(sock->conn.sin_port), seq,
-                               ack, hlen, plen, 0, 1, 0, NULL, payload,
+                               ack, hlen, plen, ACK_FLAG_MASK, 1, 0, NULL, payload,
                                payload_len);
   sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
         conn_len);
