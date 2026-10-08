@@ -55,11 +55,14 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   // data packet should use.
   static int rng_seeded = 0;
   if (!rng_seeded) {
-    srandom((unsigned int)time(NULL) ^ (unsigned int)getpid());
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    unsigned int seed =
+        (unsigned int)ts.tv_sec ^ (unsigned int)ts.tv_nsec ^ (unsigned int)getpid();
+    srandom(seed);
     rng_seeded = 1;
   }
   sock->window.last_ack_received = (uint32_t)random();
-  // next_seq_expected is meaningless until we see the peer's SYN.
   sock->window.next_seq_expected = 0;
 
   sock->state = CLOSED;
