@@ -56,47 +56,51 @@ int has_been_acked(cmu_socket_t *sock, uint32_t seq) {
 void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
+  uint16_t payload_len = get_payload_len(pkt);
 
-  switch (flags) {
-    case ACK_FLAG_MASK: {
-      uint32_t ack = get_ack(hdr);
-      if (after(ack, sock->window.last_ack_received)) {
-        sock->window.last_ack_received = ack;
-      }
-      break;
-    }
-    default: {
-      socklen_t conn_len = sizeof(sock->conn);
-      uint32_t seq = get_seq(hdr);
-      uint16_t payload_len = get_payload_len(pkt);
-
-      if (seq == sock->window.next_seq_expected) {
-        // In-order: accept it and advance what we expect next.
-        uint8_t *payload = get_payload(pkt);
-        sock->received_buf =
-            realloc(sock->received_buf, sock->received_len + payload_len);
-        memcpy(sock->received_buf + sock->received_len, payload, payload_len);
-        sock->received_len += payload_len;
-        sock->window.next_seq_expected += payload_len;
-      }
-      // Else: out-of-order/duplicate under Go-Back-N. Drop the payload, but
-      // still ACK below with our (unchanged) next_seq_expected, so the sender
-      // knows precisely where to resume retransmitting from.
-
-      uint32_t seq_out = sock->window.last_ack_received;
-      uint32_t ack = sock->window.next_seq_expected;
-      uint16_t hlen = sizeof(cmu_tcp_header_t);
-      uint16_t plen = hlen;
-
-      uint8_t *response_packet = create_packet(
-          sock->my_port, ntohs(sock->conn.sin_port), seq_out, ack, hlen, plen,
-          ACK_FLAG_MASK, 1, 0, NULL, NULL, 0);
-      sendto(sock->socket, response_packet, plen, 0,
-            (struct sockaddr *)&(sock->conn), conn_len);
-      free(response_packet);
-      break;
+  // A piggybacked or bare ACK: update our send-side state whenever the ACK
+  // bit is set, regardless of whether this packet also carries data.
+  if (flags & ACK_FLAG_MASK) {
+    uint32_t ack = get_ack(hdr);
+    if (after(ack, sock->window.last_ack_received)) {
+      sock->window.last_ack_received = ack;
     }
   }
+
+  if (flags & FIN_FLAG_MASK) {
+    return;
+  }
+
+  if (payload_len == 0) {
+    return;  // Pure ACK, nothing more to do.
+  }
+
+  // There's data to process, whether or not ACK happened to be set too.
+  socklen_t conn_len = sizeof(sock->conn);
+  uint32_t seq = get_seq(hdr);
+
+  if (seq == sock->window.next_seq_expected) {
+    uint8_t *payload = get_payload(pkt);
+    sock->received_buf =
+        realloc(sock->received_buf, sock->received_len + payload_len);
+    memcpy(sock->received_buf + sock->received_len, payload, payload_len);
+    sock->received_len += payload_len;
+    sock->window.next_seq_expected += payload_len;
+  }
+  // Else: out-of-order/duplicate under Go-Back-N — drop the payload, but
+  // still ACK below with our current next_seq_expected.
+
+  uint32_t seq_out = sock->window.last_ack_received;
+  uint32_t ack_out = sock->window.next_seq_expected;
+  uint16_t hlen = sizeof(cmu_tcp_header_t);
+  uint16_t plen = hlen;
+
+  uint8_t *response_packet = create_packet(
+      sock->my_port, ntohs(sock->conn.sin_port), seq_out, ack_out, hlen, plen,
+      ACK_FLAG_MASK, 1, 0, NULL, NULL, 0);
+  sendto(sock->socket, response_packet, plen, 0,
+        (struct sockaddr *)&(sock->conn), conn_len);
+  free(response_packet);
 }
 
 /**
