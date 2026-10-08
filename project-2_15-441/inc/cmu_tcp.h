@@ -40,6 +40,13 @@ typedef enum {
   TCP_LISTENER = 1,
 } cmu_socket_type_t;
 
+
+typedef enum {
+  CLOSED = 0,
+  SYN_SENT,
+  SYN_RECEIVED,
+  ESTABLISHED,
+} cmu_socket_state_t;
 /**
  * This structure holds the state of a socket. You may modify this structure as
  * you see fit to include any additional state you need for your implementation.
@@ -60,6 +67,7 @@ typedef struct {
   int dying;
   pthread_mutex_t death_lock;
   window_t window;
+  cmu_socket_state_t state;
 } cmu_socket_t;
 
 /*

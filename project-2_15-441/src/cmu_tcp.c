@@ -20,6 +20,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "backend.h"
 
@@ -48,11 +49,20 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->dying = 0;
   pthread_mutex_init(&(sock->death_lock), NULL);
 
-  // FIXME: Sequence numbers should be randomly initialized. The next expected
-  // sequence number should be initialized according to the SYN packet from the
-  // other side of the connection.
-  sock->window.last_ack_received = 0;
+    // Randomly initialize our ISN. We temporarily stash it in
+  // last_ack_received; handshake() will advance it to ISN+1 once the
+  // connection is established, which is exactly the seq number the first
+  // data packet should use.
+  static int rng_seeded = 0;
+  if (!rng_seeded) {
+    srandom((unsigned int)time(NULL) ^ (unsigned int)getpid());
+    rng_seeded = 1;
+  }
+  sock->window.last_ack_received = (uint32_t)random();
+  // next_seq_expected is meaningless until we see the peer's SYN.
   sock->window.next_seq_expected = 0;
+
+  sock->state = CLOSED;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
