@@ -46,6 +46,12 @@ typedef enum {
   SYN_SENT,
   SYN_RECEIVED,
   ESTABLISHED,
+  FIN_WAIT_1,
+  FIN_WAIT_2,
+  CLOSING,
+  TIME_WAIT,
+  CLOSE_WAIT,
+  LAST_ACK,
 } cmu_socket_state_t;
 /**
  * This structure holds the state of a socket. You may modify this structure as
@@ -68,6 +74,8 @@ typedef struct {
   pthread_mutex_t death_lock;
   window_t window;
   cmu_socket_state_t state;
+  uint32_t fin_seq;
+  int64_t time_wait_deadline_ms;
 } cmu_socket_t;
 
 /*

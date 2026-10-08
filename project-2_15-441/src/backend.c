@@ -18,6 +18,7 @@
 #include "backend.h"
 
 #include <poll.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #include "cmu_tcp.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#define TIME_WAIT_LINGER_MS (2 * DEFAULT_TIMEOUT)
 
 /**
  * Tells if a given sequence number has been acknowledged by the socket.
@@ -44,6 +46,26 @@ int has_been_acked(cmu_socket_t *sock, uint32_t seq) {
   return result;
 }
 
+static int64_t now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void send_bare_ack(cmu_socket_t *sock, uint32_t ack) {
+  socklen_t conn_len = sizeof(sock->conn);
+  uint32_t seq_out = sock->window.last_ack_received;
+  uint16_t hlen = sizeof(cmu_tcp_header_t);
+  uint16_t plen = hlen;
+
+  uint8_t *response_packet = create_packet(
+      sock->my_port, ntohs(sock->conn.sin_port), seq_out, ack, hlen, plen,
+      ACK_FLAG_MASK, 1, 0, NULL, NULL, 0);
+  sendto(sock->socket, response_packet, plen, 0,
+        (struct sockaddr *)&(sock->conn), conn_len);
+  free(response_packet);
+}
+
 /**
  * Updates the socket information to represent the newly received packet.
  *
@@ -57,17 +79,73 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
   uint16_t payload_len = get_payload_len(pkt);
+  uint32_t seq = get_seq(hdr);
 
-  // A piggybacked or bare ACK: update our send-side state whenever the ACK
-  // bit is set, regardless of whether this packet also carries data.
   if (flags & ACK_FLAG_MASK) {
     uint32_t ack = get_ack(hdr);
     if (after(ack, sock->window.last_ack_received)) {
       sock->window.last_ack_received = ack;
     }
+
+    // Does this ack satisfy a FIN we sent?
+    if ((sock->state == FIN_WAIT_1 || sock->state == CLOSING ||
+         sock->state == LAST_ACK) &&
+        ack == sock->fin_seq + 1) {
+      if (sock->state == FIN_WAIT_1 && (flags & FIN_FLAG_MASK)) {
+        // Combined FIN+ACK: direct arc, skip FIN_WAIT_2/CLOSING entirely.
+        if (seq == sock->window.next_seq_expected) {
+          sock->window.next_seq_expected = seq + 1;
+        }
+        send_bare_ack(sock, sock->window.next_seq_expected);
+        sock->state = TIME_WAIT;
+        sock->time_wait_deadline_ms = now_ms() + TIME_WAIT_LINGER_MS;
+        return;
+      }
+      if (sock->state == FIN_WAIT_1) {
+        sock->state = FIN_WAIT_2;
+      } else if (sock->state == CLOSING) {
+        sock->state = TIME_WAIT;
+        sock->time_wait_deadline_ms = now_ms() + TIME_WAIT_LINGER_MS;
+        return;
+      } else {  // LAST_ACK
+        sock->state = CLOSED;
+        return;
+      }
+    }
   }
 
   if (flags & FIN_FLAG_MASK) {
+    if (seq == sock->window.next_seq_expected) {
+      // Buffer any data piggybacked on the FIN, then consume the FIN's own
+      // sequence number slot.
+      if (payload_len > 0) {
+        uint8_t *payload = get_payload(pkt);
+        sock->received_buf =
+            realloc(sock->received_buf, sock->received_len + payload_len);
+        memcpy(sock->received_buf + sock->received_len, payload, payload_len);
+        sock->received_len += payload_len;
+      }
+      sock->window.next_seq_expected = seq + payload_len + 1;
+    }
+    send_bare_ack(sock, sock->window.next_seq_expected);
+
+    switch (sock->state) {
+      case ESTABLISHED:
+        sock->state = CLOSE_WAIT;
+        break;
+      case FIN_WAIT_1:
+        sock->state = CLOSING;
+        break;
+      case FIN_WAIT_2:
+        sock->state = TIME_WAIT;
+        sock->time_wait_deadline_ms = now_ms() + TIME_WAIT_LINGER_MS;
+        break;
+      case TIME_WAIT:
+        sock->time_wait_deadline_ms = now_ms() + TIME_WAIT_LINGER_MS;
+        break;
+      default:
+        break;  // CLOSE_WAIT / LAST_ACK: duplicate FIN, already re-ack'd above
+    }
     return;
   }
 
@@ -75,10 +153,8 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     return;  // Pure ACK, nothing more to do.
   }
 
-  // There's data to process, whether or not ACK happened to be set too.
-  socklen_t conn_len = sizeof(sock->conn);
-  uint32_t seq = get_seq(hdr);
-
+  // Ordinary data handling (unchanged from before) — reached regardless of
+  // state, so CLOSE_WAIT can still receive data.
   if (seq == sock->window.next_seq_expected) {
     uint8_t *payload = get_payload(pkt);
     sock->received_buf =
@@ -87,20 +163,8 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     sock->received_len += payload_len;
     sock->window.next_seq_expected += payload_len;
   }
-  // Else: out-of-order/duplicate under Go-Back-N — drop the payload, but
-  // still ACK below with our current next_seq_expected.
 
-  uint32_t seq_out = sock->window.last_ack_received;
-  uint32_t ack_out = sock->window.next_seq_expected;
-  uint16_t hlen = sizeof(cmu_tcp_header_t);
-  uint16_t plen = hlen;
-
-  uint8_t *response_packet = create_packet(
-      sock->my_port, ntohs(sock->conn.sin_port), seq_out, ack_out, hlen, plen,
-      ACK_FLAG_MASK, 1, 0, NULL, NULL, 0);
-  sendto(sock->socket, response_packet, plen, 0,
-        (struct sockaddr *)&(sock->conn), conn_len);
-  free(response_packet);
+  send_bare_ack(sock, sock->window.next_seq_expected);
 }
 
 /**
@@ -350,6 +414,51 @@ static void send_data_segment(cmu_socket_t *sock, uint8_t *payload,
   free(pkt);
 }
 
+static void send_fin(cmu_socket_t *sock) {
+  socklen_t conn_len = sizeof(sock->conn);
+  uint16_t hlen = sizeof(cmu_tcp_header_t);
+  uint16_t plen = hlen;
+
+  uint8_t *pkt = create_packet(
+      sock->my_port, ntohs(sock->conn.sin_port), sock->fin_seq,
+      sock->window.next_seq_expected, hlen, plen,
+      FIN_FLAG_MASK | ACK_FLAG_MASK, 1, 0, NULL, NULL, 0);
+  sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
+        conn_len);
+  free(pkt);
+}
+
+/**
+ * Drives our side's active close. Handles both "we close first"
+ * (ESTABLISHED -> FIN_WAIT_1 -> ...) and "peer already closed, now we close
+ * too" (CLOSE_WAIT -> LAST_ACK -> CLOSED). All the reactive state
+ * transitions happen inside handle_message(), called via check_for_data();
+ * this function just sends/resends the FIN and waits for things to settle.
+ */
+static void teardown_active(cmu_socket_t *sock) {
+  sock->fin_seq = sock->window.last_ack_received;
+  send_fin(sock);
+  sock->state = (sock->state == CLOSE_WAIT) ? LAST_ACK : FIN_WAIT_1;
+
+  while (sock->state != TIME_WAIT && sock->state != CLOSED) {
+    cmu_socket_state_t prev_state = sock->state;
+    check_for_data(sock, TIMEOUT);
+    if (sock->state == prev_state) {
+      send_fin(sock);  // Timed out with no progress: resend.
+    }
+  }
+
+  if (sock->state == CLOSED) {
+    return;  // LAST_ACK path: no TIME_WAIT needed.
+  }
+
+  while (now_ms() < sock->time_wait_deadline_ms) {
+    check_for_data(sock, TIMEOUT);  // Re-acks any retransmitted FIN, which
+                                     // also pushes time_wait_deadline_ms out.
+  }
+  sock->state = CLOSED;
+}
+
 /**
  * Sends buf_len bytes using a fixed-size Go-Back-N window (CP1_WINDOW_SIZE
  * bytes). Blocks until everything has been sent and cumulatively ACKed.
@@ -407,6 +516,8 @@ void *begin_backend(void *in) {
     buf_len = sock->sending_len;
 
     if (death && buf_len == 0) {
+      pthread_mutex_unlock(&(sock->send_lock));  // was previously left locked
+      teardown_active(sock);
       break;
     }
 

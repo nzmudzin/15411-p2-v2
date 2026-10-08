@@ -63,6 +63,8 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->window.next_seq_expected = 0;
 
   sock->state = CLOSED;
+  sock->fin_seq = 0;
+  sock->time_wait_deadline_ms = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
