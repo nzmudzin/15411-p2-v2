@@ -439,12 +439,21 @@ static void teardown_active(cmu_socket_t *sock) {
   sock->fin_seq = sock->window.last_ack_received;
   send_fin(sock);
   sock->state = (sock->state == CLOSE_WAIT) ? LAST_ACK : FIN_WAIT_1;
+  int64_t fin_deadline = now_ms() + DEFAULT_TIMEOUT;
+  struct pollfd fin_fd = {.fd = sock->socket, .events = POLLIN};
 
   while (sock->state != TIME_WAIT && sock->state != CLOSED) {
-    cmu_socket_state_t prev_state = sock->state;
-    check_for_data(sock, TIMEOUT);
-    if (sock->state == prev_state) {
-      send_fin(sock);  // Timed out with no progress: resend.
+    int64_t remaining = fin_deadline - now_ms();
+    int wait_ms = sock->state == FIN_WAIT_2
+                      ? DEFAULT_TIMEOUT
+                      : (remaining > 0 ? (int)remaining : 0);
+    if (poll(&fin_fd, 1, wait_ms) > 0) {
+      check_for_data(sock, NO_WAIT);
+    }
+    if ((sock->state == FIN_WAIT_1 || sock->state == CLOSING ||
+         sock->state == LAST_ACK) && now_ms() >= fin_deadline) {
+      send_fin(sock);
+      fin_deadline = now_ms() + DEFAULT_TIMEOUT;
     }
   }
 
