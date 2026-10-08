@@ -32,9 +32,11 @@ Vagrant.configure(2) do |config|
     docker.remains_running = true
     docker.has_ssh = true
     docker.privileged = true
-    docker.create_args = ["--cgroupns=host"]
-    docker.volumes = ["/sys/fs/cgroup:/sys/fs/cgroup:rw"]
-  end
+    docker.create_args = [
+      "--cgroupns=host",
+      "--mount", "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup"
+    ]
+end
 
   config.vm.provider "virtualbox" do |v, override|
     override.vm.box = "ubuntu/jammy64"
